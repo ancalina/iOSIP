@@ -5,7 +5,7 @@ outgoing and incoming calls, native call UI, audio routing, call controls,
 return-to-call status bar behavior, recents integration, and missed-call
 notifications.
 
-## Supported devices
+## Tested devices
 
 - iPhone 5 running iOS 6.1.4
 - iPhone 4S running iOS 6.1.3
