@@ -1,0 +1,5 @@
+"SETTINGS_SAVED" = "저장했습니다. SIP를 다시 등록합니다.";
+"SETTINGS_BUSY" = "통화 중에는 적용할 수 없습니다.";
+"SETTINGS_INVALID" = "서버, 포트, 사용자 이름, 암호를 확인하십시오.";
+"DAEMON_UNAVAILABLE" = "iOSIP daemon에 연결할 수 없습니다.";
+"OK" = "확인";

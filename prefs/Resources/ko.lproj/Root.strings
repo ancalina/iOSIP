@@ -1,0 +1,9 @@
+"SIP_ACCOUNT" = "SIP 계정";
+"SERVER" = "서버";
+"PORT" = "포트";
+"USERNAME" = "사용자 이름";
+"PASSWORD" = "암호";
+"NETWORK" = "네트워크";
+"MEDIA_HOST" = "MediaHost";
+"MEDIA_HOST_FOOTER" = "공인 SDP 주소가 현재 RTP 주소와 다를 때만 MediaHost를 설정하십시오.";
+"SAVE_AND_REREGISTER" = "저장 및 SIP 재등록";

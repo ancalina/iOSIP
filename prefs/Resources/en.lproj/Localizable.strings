@@ -1,0 +1,5 @@
+"SETTINGS_SAVED" = "Settings saved. SIP will re-register.";
+"SETTINGS_BUSY" = "Settings cannot be applied during a call.";
+"SETTINGS_INVALID" = "Check the server, port, username, and password.";
+"DAEMON_UNAVAILABLE" = "Unable to connect to the iOSIP daemon.";
+"OK" = "OK";

@@ -1,0 +1,26 @@
+# Local credentials and device configuration
+.iphone-askpass
+.mac-askpass
+.known_hosts_*
+config/*.plist
+!config/device.example.plist
+
+# Private investigation and rollback artifacts
+analysis/
+packages/
+PLAN.md
+sipdroid/
+
+# Build products
+.theos/
+*.deb
+*.dylib
+*.pyc
+__pycache__/
+.DS_Store
+
+# Locally built device helpers
+tools/frontmost
+tools/iosip-screenshot
+tools/iosip-tap
+tools/iosip-wake

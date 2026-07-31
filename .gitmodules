@@ -1,0 +1,3 @@
+[submodule "vendor/pjproject"]
+	path = vendor/pjproject
+	url = https://github.com/pjsip/pjproject.git

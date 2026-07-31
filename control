@@ -1,0 +1,9 @@
+Package: me.ancal.iosip
+Name: iOSIP
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: SIP-first calling for iOS 6 Phone.app
+Maintainer: ancalina
+Author: ancalina
+Section: Tweaks
+Depends: mobilesubstrate, preferenceloader
