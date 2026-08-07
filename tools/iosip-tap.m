@@ -1,4 +1,5 @@
 #import <GraphicsServices/GraphicsServices.h>
+#include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -9,10 +10,17 @@ typedef struct {
     GSPathInfo path;
 } IOSIPTouchEvent;
 
+#if __LP64__
+_Static_assert(sizeof(GSEventRecord) == 80, "unexpected GSEventRecord");
+_Static_assert(sizeof(GSHandInfo) == 40, "unexpected GSHandInfo");
+_Static_assert(sizeof(GSPathInfo) == 48, "unexpected GSPathInfo");
+_Static_assert(sizeof(IOSIPTouchEvent) == 168, "unexpected touch event");
+#else
 _Static_assert(sizeof(GSEventRecord) == 52, "unexpected GSEventRecord");
 _Static_assert(sizeof(GSHandInfo) == 36, "unexpected GSHandInfo");
 _Static_assert(sizeof(GSPathInfo) == 24, "unexpected GSPathInfo");
 _Static_assert(sizeof(IOSIPTouchEvent) == 112, "unexpected touch event");
+#endif
 
 static void SendTouch(CGPoint point, GSHandInfoType type)
 {
@@ -38,6 +46,9 @@ static void SendTouch(CGPoint point, GSHandInfoType type)
 
 int main(int argc, char **argv)
 {
+    if (!dlopen("/System/Library/PrivateFrameworks/GraphicsServices.framework/GraphicsServices",
+                RTLD_LAZY | RTLD_GLOBAL))
+        return 1;
     if (argc == 2) {
         GSSendSimpleEvent(
             (GSEventType)atoi(argv[1]), GSGetPurpleSystemEventPort());

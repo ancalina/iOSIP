@@ -7,10 +7,13 @@ notifications.
 
 ## Tested devices
 
+- iPhone 3GS running iOS 6.1.6
 - iPhone 5 running iOS 6.1.4
 - iPhone 4S running iOS 6.1.3
+- iPhone 6s Plus running iOS 9.3.4
 
-Other devices and iOS versions are untested.
+The package contains both `armv7` and `arm64` binaries. Other devices and
+iOS versions are untested.
 
 Settings languages: English and Korean.
 

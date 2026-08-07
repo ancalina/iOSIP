@@ -2,6 +2,7 @@
 .iphone-askpass
 .mac-askpass
 .known_hosts_*
+credentials/
 config/*.plist
 !config/device.example.plist
 

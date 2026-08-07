@@ -4,17 +4,14 @@
 #include <pjsua-lib/pjsua.h>
 #include <pjsua-lib/pjsua_internal.h>
 #include <arpa/inet.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <mach/mach.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/un.h>
 #include <unistd.h>
-
-extern int SBSLaunchApplicationWithIdentifier(CFStringRef identifier,
-                                               Boolean suspended);
 
 static NSString *const ConfigPath =
     @"/var/mobile/Library/Preferences/me.ancal.iosip.plist";
@@ -23,9 +20,28 @@ static NSString *const StatePath =
     @"/var/mobile/Library/IOSIP/state.plist";
 static NSString *const HistoryPath =
     @"/var/mobile/Library/IOSIP/history.plist";
+static NSString *const IPCTokenPath =
+    @"/var/mobile/Library/IOSIP/ipc-token";
 static NSString *const CallStateLock =
     @"me.ancal.iosip.call-state";
-static const char *SocketPath = "/var/run/iosip.sock";
+static const uint16_t IPCPort = 51601;
+static NSString *IPCToken;
+
+static void LaunchPhoneApplication(void)
+{
+    static int (*launch)(CFStringRef, Boolean);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *framework = dlopen(
+            "/System/Library/PrivateFrameworks/"
+            "SpringBoardServices.framework/SpringBoardServices",
+            RTLD_LAZY);
+        launch = dlsym(framework ?: RTLD_DEFAULT,
+                       "SBSLaunchApplicationWithIdentifier");
+    });
+    if (launch)
+        launch(CFSTR("com.apple.mobilephone"), false);
+}
 
 static pjsua_acc_id AccountID = PJSUA_INVALID_ID;
 static pjsua_call_id CallID = PJSUA_INVALID_ID;
@@ -70,6 +86,26 @@ static BOOL ConfigureClientSocket(int socketFD)
                       sizeof(timeout)) == 0 &&
            setsockopt(socketFD, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                       sizeof(timeout)) == 0;
+}
+
+static BOOL LoadIPCToken(void)
+{
+    IPCToken = [[NSString stringWithContentsOfFile:IPCTokenPath
+                                         encoding:NSUTF8StringEncoding
+                                            error:nil]
+        stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (IPCToken.length < 16) {
+        IPCToken = [NSUUID UUID].UUIDString;
+        if (![IPCToken writeToFile:IPCTokenPath
+                        atomically:YES
+                          encoding:NSUTF8StringEncoding
+                             error:nil])
+            return NO;
+    }
+    chown(IPCTokenPath.fileSystemRepresentation, 0, 501);
+    chmod(IPCTokenPath.fileSystemRepresentation, 0640);
+    return YES;
 }
 
 static ssize_t ReadCommand(int socketFD, char *buffer, size_t capacity)
@@ -613,8 +649,7 @@ static void OnIncomingCall(pjsua_acc_id accountID,
             }
             if (!current)
                 return;
-            SBSLaunchApplicationWithIdentifier(
-                CFSTR("com.apple.mobilephone"), false);
+            LaunchPhoneApplication();
         });
     }
 }
@@ -1300,52 +1335,51 @@ static NSString *HandleCommand(NSString *command)
 
 static void Serve(void)
 {
-    unlink(SocketPath);
-    int server = socket(AF_UNIX, SOCK_STREAM, 0);
+    int server = socket(AF_INET, SOCK_STREAM, 0);
     if (server < 0)
         return;
 
-    struct sockaddr_un address = {0};
-    address.sun_family = AF_UNIX;
-    strlcpy(address.sun_path, SocketPath, sizeof(address.sun_path));
+    int reuse = 1;
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    struct sockaddr_in address = {0};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(IPCPort);
     if (bind(server, (struct sockaddr *)&address, sizeof(address)) != 0 ||
         listen(server, 4) != 0) {
         close(server);
-        unlink(SocketPath);
         return;
     }
-    chown(SocketPath, 0, 501);
-    chmod(SocketPath, 0660);
 
     for (;;) {
         @autoreleasepool {
-        int client = accept(server, NULL, NULL);
+        struct sockaddr_in peer = {0};
+        socklen_t peerLength = sizeof(peer);
+        int client = accept(server, (struct sockaddr *)&peer, &peerLength);
         if (client < 0) {
             if (errno == EINTR)
                 continue;
             break;
         }
-        if (!ConfigureClientSocket(client)) {
+        if (peer.sin_family != AF_INET ||
+            peer.sin_addr.s_addr != htonl(INADDR_LOOPBACK) ||
+            !ConfigureClientSocket(client)) {
             close(client);
             continue;
         }
-        uid_t user;
-        gid_t group;
-        if (getpeereid(client, &user, &group) != 0 ||
-            (user != 0 && user != 501)) {
-            close(client);
-            continue;
-        }
-        char buffer[256] = {0};
+        char buffer[512] = {0};
         ssize_t length = ReadCommand(client, buffer, sizeof(buffer));
         if (length >= 0) {
-            NSString *command = [[[NSString alloc]
+            NSString *request = [[[NSString alloc]
                 initWithBytes:buffer
                        length:(NSUInteger)length
                      encoding:NSUTF8StringEncoding]
                 stringByTrimmingCharactersInSet:
                     [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            NSString *response = HandleCommand(command ?: @"");
+            NSString *prefix = [IPCToken stringByAppendingString:@" "];
+            NSString *response = [request hasPrefix:prefix] ?
+                HandleCommand([request substringFromIndex:prefix.length]) :
+                @"UNAUTHORIZED";
             NSData *data = [[response stringByAppendingString:@"\n"]
                 dataUsingEncoding:NSUTF8StringEncoding];
             WriteAll(client, data.bytes, data.length);
@@ -1356,7 +1390,6 @@ static void Serve(void)
         }
     }
     close(server);
-    unlink(SocketPath);
 }
 
 int main(int argc, char **argv)
@@ -1364,6 +1397,8 @@ int main(int argc, char **argv)
     @autoreleasepool {
         RestoreStateMetadata();
         PostState(@"idle", @"");
+        if (!LoadIPCToken())
+            return 1;
         NSDictionary *config =
             [NSDictionary dictionaryWithContentsOfFile:ConfigPath];
         BOOL validConfig = ConfigIsValid(config);

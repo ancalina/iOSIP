@@ -1,17 +1,17 @@
 #!/bin/sh
-set -e
+set +e
 
-/usr/bin/ldid -S /usr/libexec/iosipd
-/usr/bin/ldid -S /usr/bin/iosipctl
-/usr/bin/ldid -S /Library/MobileSubstrate/DynamicLibraries/IOSIP.dylib
-/usr/bin/ldid -S /Library/PreferenceBundles/IOSIPPrefs.bundle/IOSIPPrefs
-/bin/rm -f /var/mobile/Library/IOSIP/ui-command.plist
-/bin/rm -f /var/mobile/Library/IOSIP/events.plist
-launchctl unload /Library/LaunchDaemons/me.ancal.iosipd.plist \
-    2>/dev/null || true
-launchctl load /Library/LaunchDaemons/me.ancal.iosipd.plist
-killall MobilePhone 2>/dev/null || true
-killall Preferences 2>/dev/null || true
-killall SpringBoard 2>/dev/null || true
+/bin/launchctl unload /Library/LaunchDaemons/me.ancal.iosipd.plist \
+    >/dev/null 2>&1 || true
+/usr/bin/killall iosipd >/dev/null 2>&1 || true
+/bin/rm -f /var/run/iosip.sock \
+    /var/mobile/Library/IOSIP/iosip.sock
+/bin/launchctl load /Library/LaunchDaemons/me.ancal.iosipd.plist \
+    >/dev/null 2>&1 || true
+/bin/sleep 1
+if ! /usr/bin/iosipctl STATUS >/dev/null 2>&1; then
+    /usr/libexec/iosipd </dev/null >/dev/null 2>&1 &
+    /bin/sleep 2
+fi
 
 exit 0

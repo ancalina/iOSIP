@@ -1,7 +1,7 @@
+#include <arpa/inet.h>
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/time.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 #include <stdio.h>
@@ -23,12 +23,25 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-    if (strlcat(command, "\n", sizeof(command)) >= sizeof(command)) {
+    FILE *tokenFile = fopen("/var/mobile/Library/IOSIP/ipc-token", "r");
+    char token[64] = {0};
+    if (!tokenFile || !fgets(token, sizeof(token), tokenFile)) {
+        if (tokenFile)
+            fclose(tokenFile);
+        fprintf(stderr, "iosipctl: token unavailable\n");
+        return 1;
+    }
+    fclose(tokenFile);
+    token[strcspn(token, "\r\n")] = '\0';
+    char request[384] = {0};
+    if (strlen(token) < 16 ||
+        snprintf(request, sizeof(request), "%s %s\n", token, command) >=
+            (int)sizeof(request)) {
         fprintf(stderr, "iosipctl: command too long\n");
         return 2;
     }
 
-    int socketFD = socket(AF_UNIX, SOCK_STREAM, 0);
+    int socketFD = socket(AF_INET, SOCK_STREAM, 0);
     if (socketFD < 0) {
         perror("iosipctl");
         return 1;
@@ -45,17 +58,17 @@ int main(int argc, char **argv)
         close(socketFD);
         return 1;
     }
-    struct sockaddr_un address = {0};
-    address.sun_family = AF_UNIX;
-    strlcpy(address.sun_path, "/var/run/iosip.sock",
-            sizeof(address.sun_path));
+    struct sockaddr_in address = {0};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(51601);
     if (connect(socketFD, (struct sockaddr *)&address, sizeof(address))) {
         perror("iosipctl");
         close(socketFD);
         return 1;
     }
-    const char *cursor = command;
-    size_t remaining = strlen(command);
+    const char *cursor = request;
+    size_t remaining = strlen(request);
     while (remaining) {
         ssize_t written = write(socketFD, cursor, remaining);
         if (written > 0) {

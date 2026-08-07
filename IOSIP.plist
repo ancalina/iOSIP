@@ -2,7 +2,8 @@
 	Filter = {
 		Bundles = (
 			"com.apple.mobilephone",
-			"com.apple.springboard"
+			"com.apple.springboard",
+			"com.apple.InCallService"
 		);
 	};
 }

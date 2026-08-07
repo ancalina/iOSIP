@@ -18,15 +18,14 @@ typedef void (*CTStatusCallback)(void *center, void *observer,
 - (void)endInterruptionWithStatus:(id)status;
 - (BOOL)_routeIsHandset:(id)route;
 - (BOOL)_routeIsSpeaker:(id)route;
-- (void)setCharge:(float)charge;
 @end
 
-extern CFStringRef kCTCallStatusChangeNotification;
-extern CFStringRef kCTCallIdentificationChangeNotification;
-extern CFStringRef kCTCallHistoryRecordAddNotification;
-extern CFStringRef kCTCallHistorySignificantChangeNotification;
-extern CFStringRef kCTCall;
-extern CFStringRef kCTCallTypeNormal;
+static CFStringRef IOSIPCTCallStatusChangeNotification;
+static CFStringRef IOSIPCTCallIdentificationChangeNotification;
+static CFStringRef IOSIPCTCallHistoryRecordAddNotification;
+static CFStringRef IOSIPCTCallHistorySignificantChangeNotification;
+static CFStringRef IOSIPCTCall;
+static CFStringRef IOSIPCTCallTypeNormal;
 
 static NSString *const IOSIPNotification = @"me.ancal.iosip.state";
 static NSString *const IOSIPHistoryNotification =
@@ -41,9 +40,26 @@ static NSMutableDictionary *IOSIPHistoryTokens;
 static unsigned long long IOSIPGeneration;
 static unsigned long long IOSIPHistoryGeneration;
 static BOOL IOSIPIsSpringBoardProcess;
+static BOOL IOSIPIsInCallServiceProcess;
 static BOOL IOSIPPhoneAudioReleased;
 static BOOL IOSIPMuted;
 static id IOSIPPhoneAudioController;
+static id IOSIPModernCall;
+static id IOSIPModernCallGroup;
+static NSString *IOSIPTUCallStatusNotification;
+static NSString *IOSIPTUCallModelNotification;
+static NSString *IOSIPTUCallConnectedNotification;
+static NSString *IOSIPActivatedCallID;
+
+static void IOSIPNotifyModernState(void);
+static void IOSIPActivateModernCallUI(void);
+
+static CFStringRef IOSIPCoreTelephonyConstant(const char *symbol,
+                                               CFStringRef fallback)
+{
+    CFStringRef *value = dlsym(RTLD_DEFAULT, symbol);
+    return value && *value ? *value : fallback;
+}
 
 typedef struct {
     void *center;
@@ -211,6 +227,14 @@ static BOOL IOSIPHasCall(void)
            [state isEqualToString:@"ended"];
 }
 
+static BOOL IOSIPModernHasCall(void)
+{
+    NSString *state = IOSIPCurrentState[@"state"];
+    return [state isEqualToString:@"incoming"] ||
+           [state isEqualToString:@"calling"] ||
+           [state isEqualToString:@"connected"];
+}
+
 static int IOSIPCallStatus(void)
 {
     NSString *state = IOSIPCurrentState[@"state"];
@@ -319,10 +343,10 @@ static void IOSIPNotifyHistoryRecordAdded(NSDictionary *record)
             IOSIPHistoryRecord((__bridge CTCallRef)token)))
         return;
     NSDictionary *userInfo = @{
-        (__bridge NSString *)kCTCall: token
+        (__bridge NSString *)IOSIPCTCall: token
     };
     IOSIPNotifyObserversWithInfo(
-        kCTCallHistoryRecordAddNotification,
+        IOSIPCTCallHistoryRecordAddNotification,
         (__bridge CTCallRef)token,
         (__bridge CFDictionaryRef)userInfo);
 }
@@ -351,10 +375,12 @@ static void IOSIPReloadState(void)
         IOSIPPhoneAudioReleased = NO;
         IOSIPMuted = NO;
     }
-    IOSIPNotifyObservers(kCTCallStatusChangeNotification);
+    IOSIPNotifyObservers(IOSIPCTCallStatusChangeNotification);
     if ([callState isEqualToString:@"incoming"] ||
         [callState isEqualToString:@"calling"])
-        IOSIPNotifyObservers(kCTCallIdentificationChangeNotification);
+        IOSIPNotifyObservers(IOSIPCTCallIdentificationChangeNotification);
+    IOSIPNotifyModernState();
+    IOSIPActivateModernCallUI();
     if (historyChanged)
         IOSIPNotifyHistoryRecordAdded(lastEnd);
     if (IOSIPIsSpringBoardProcess &&
@@ -378,6 +404,18 @@ static void IOSIPStateChanged(CFNotificationCenterRef center,
                                CFDictionaryRef userInfo)
 {
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (IOSIPIsSpringBoardProcess &&
+            [UIDevice currentDevice].systemVersion.integerValue >= 7) {
+            NSDictionary *state = IOSIPState();
+            unsigned long long generation =
+                [state[@"generation"] unsignedLongLongValue];
+            if (!state || generation == IOSIPGeneration)
+                return;
+            IOSIPCurrentState = state;
+            IOSIPGeneration = generation;
+            IOSIPActivateModernCallUI();
+            return;
+        }
         IOSIPReloadState();
     });
 }
@@ -391,7 +429,7 @@ static void IOSIPHistoryChanged(CFNotificationCenterRef center,
     dispatch_async(dispatch_get_main_queue(), ^{
         IOSIPReloadHistory();
         IOSIPNotifyObserversWithInfo(
-            kCTCallHistorySignificantChangeNotification, NULL, NULL);
+            IOSIPCTCallHistorySignificantChangeNotification, NULL, NULL);
         IOSIPNotifyRecents();
     });
 }
@@ -421,6 +459,297 @@ static NSString *IOSIPNormalizeNumber(NSString *value)
 static BOOL IOSIPIsDialableNumber(NSString *value)
 {
     return IOSIPNormalizeNumber(value) != nil;
+}
+
+static NSString *IOSIPDialReply(NSString *number)
+{
+    NSString *normalized = IOSIPNormalizeNumber(number);
+    if (!normalized)
+        return nil;
+    NSString *reply = IOSIPCommand(
+        [@"CALL " stringByAppendingString:normalized]);
+    if ([reply isEqualToString:@"OK"]) {
+        NSDictionary *state = IOSIPState();
+        if (state)
+            IOSIPCurrentState = state;
+    }
+    return reply;
+}
+
+static int IOSIPModernCallStatus(id self, SEL selector)
+{
+    NSString *state = IOSIPCurrentState[@"state"];
+    if ([state isEqualToString:@"connected"])
+        return 1;
+    if ([state isEqualToString:@"calling"])
+        return 3;
+    if ([state isEqualToString:@"incoming"])
+        return 4;
+    return 6;
+}
+
+static BOOL IOSIPModernCallIsOutgoing(id self, SEL selector)
+{
+    return [IOSIPCurrentState[@"direction"] isEqualToString:@"outgoing"];
+}
+
+static BOOL IOSIPModernCallIsConnected(id self, SEL selector)
+{
+    return [IOSIPCurrentState[@"state"] isEqualToString:@"connected"];
+}
+
+static BOOL IOSIPModernCallIsConnecting(id self, SEL selector)
+{
+    return [IOSIPCurrentState[@"state"] isEqualToString:@"calling"];
+}
+
+static BOOL IOSIPModernCallIsAlerting(id self, SEL selector)
+{
+    return [IOSIPCurrentState[@"state"] isEqualToString:@"incoming"];
+}
+
+static BOOL IOSIPModernCallIsActive(id self, SEL selector)
+{
+    return IOSIPModernHasCall();
+}
+
+static BOOL IOSIPModernCallIsFinal(id self, SEL selector)
+{
+    NSString *state = IOSIPCurrentState[@"state"];
+    return [state isEqualToString:@"ended"] ||
+           [state isEqualToString:@"idle"];
+}
+
+static BOOL IOSIPModernYes(id self, SEL selector)
+{
+    return YES;
+}
+
+static BOOL IOSIPModernNo(id self, SEL selector)
+{
+    return NO;
+}
+
+static NSString *IOSIPModernCallNumber(id self, SEL selector)
+{
+    return IOSIPRemoteNumber();
+}
+
+static NSString *IOSIPModernCallIdentifier(id self, SEL selector)
+{
+    return IOSIPCurrentState[@"call_id"] ?: @"me.ancal.iosip.call";
+}
+
+static NSUUID *IOSIPModernCallUUID(id self, SEL selector)
+{
+    return [[NSUUID alloc] initWithUUIDString:IOSIPModernCallIdentifier(nil, 0)];
+}
+
+static NSString *IOSIPModernSourceIdentifier(id self, SEL selector)
+{
+    return @"me.ancal.iosip";
+}
+
+static NSString *IOSIPModernAudioCategory(id self, SEL selector)
+{
+    return @"PhoneCall";
+}
+
+static NSString *IOSIPModernAudioMode(id self, SEL selector)
+{
+    return @"VoiceChat";
+}
+
+static int IOSIPModernService(id self, SEL selector)
+{
+    return 1;
+}
+
+static double IOSIPModernStartTime(id self, SEL selector)
+{
+    id start = IOSIPCurrentState[@"connected_at"] ?:
+        IOSIPCurrentState[@"started_at"];
+    return [start isKindOfClass:[NSDate class]] ?
+        [start timeIntervalSinceReferenceDate] :
+        ([start respondsToSelector:@selector(doubleValue)] ?
+            [start doubleValue] : 0);
+}
+
+static double IOSIPModernCallDuration(id self, SEL selector)
+{
+    id start = IOSIPCurrentState[@"connected_at"];
+    if ([start isKindOfClass:[NSDate class]])
+        return MAX(0, [[NSDate date] timeIntervalSinceDate:start]);
+    double value = [start respondsToSelector:@selector(doubleValue)] ?
+        [start doubleValue] : 0;
+    return value > 0 ?
+        MAX(0, [[NSDate date] timeIntervalSince1970] - value) : 0;
+}
+
+static void IOSIPModernAnswer(id self, SEL selector)
+{
+    IOSIPCommand(@"ANSWER");
+}
+
+static void IOSIPModernDisconnect(id self, SEL selector)
+{
+    IOSIPCommand(@"HANGUP TUCall");
+}
+
+static BOOL IOSIPModernSetMuted(id self, SEL selector, BOOL muted)
+{
+    BOOL success = [IOSIPCommand(muted ? @"MUTE 1" : @"MUTE 0")
+        isEqualToString:@"OK"];
+    if (success)
+        IOSIPMuted = muted;
+    return success;
+}
+
+static BOOL IOSIPModernIsMuted(id self, SEL selector)
+{
+    return IOSIPMuted;
+}
+
+static void IOSIPModernPlayDTMF(id self, SEL selector, unsigned char key)
+{
+    IOSIPCommand([NSString stringWithFormat:@"DTMF %c", key]);
+}
+
+static void IOSIPModernAddMethod(Class cls, NSString *name, IMP method,
+                                  const char *types)
+{
+    class_addMethod(cls, NSSelectorFromString(name), method, types);
+}
+
+static BOOL IOSIPCreateModernCall(void)
+{
+    Class callClass = objc_getClass("TUCall");
+    Class groupClass = objc_getClass("TUCallGroup");
+    if (!callClass || !groupClass)
+        return NO;
+    Class cls = objc_getClass("IOSIPSyntheticTUCall");
+    if (!cls) {
+        cls = objc_allocateClassPair(callClass,
+                                     "IOSIPSyntheticTUCall", 0);
+        IOSIPModernAddMethod(cls, @"status", (IMP)IOSIPModernCallStatus,
+                             "i@:");
+        IOSIPModernAddMethod(cls, @"callStatus", (IMP)IOSIPModernCallStatus,
+                             "i@:");
+        IOSIPModernAddMethod(cls, @"transitionStatus",
+                             (IMP)IOSIPModernCallStatus, "i@:");
+        IOSIPModernAddMethod(cls, @"service", (IMP)IOSIPModernService,
+                             "i@:");
+        IOSIPModernAddMethod(cls, @"destinationID",
+                             (IMP)IOSIPModernCallNumber, "@@:");
+        IOSIPModernAddMethod(cls, @"displayName",
+                             (IMP)IOSIPModernCallNumber, "@@:");
+        IOSIPModernAddMethod(cls, @"multiLineDisplayName",
+                             (IMP)IOSIPModernCallNumber, "@@:");
+        IOSIPModernAddMethod(cls, @"suggestedDisplayName",
+                             (IMP)IOSIPModernCallNumber, "@@:");
+        IOSIPModernAddMethod(cls, @"uniqueProxyIdentifier",
+                             (IMP)IOSIPModernCallIdentifier, "@@:");
+        IOSIPModernAddMethod(cls, @"callHistoryIdentifier",
+                             (IMP)IOSIPModernCallIdentifier, "@@:");
+        IOSIPModernAddMethod(cls, @"callUUID", (IMP)IOSIPModernCallUUID,
+                             "@@:");
+        IOSIPModernAddMethod(cls, @"sourceIdentifier",
+                             (IMP)IOSIPModernSourceIdentifier, "@@:");
+        IOSIPModernAddMethod(cls, @"audioCategory",
+                             (IMP)IOSIPModernAudioCategory, "@@:");
+        IOSIPModernAddMethod(cls, @"audioMode", (IMP)IOSIPModernAudioMode,
+                             "@@:");
+        IOSIPModernAddMethod(cls, @"startTime", (IMP)IOSIPModernStartTime,
+                             "d@:");
+        IOSIPModernAddMethod(cls, @"callDuration",
+                             (IMP)IOSIPModernCallDuration, "d@:");
+        IOSIPModernAddMethod(cls, @"isOutgoing",
+                             (IMP)IOSIPModernCallIsOutgoing, "B@:");
+        IOSIPModernAddMethod(cls, @"isConnected",
+                             (IMP)IOSIPModernCallIsConnected, "B@:");
+        IOSIPModernAddMethod(cls, @"isConnecting",
+                             (IMP)IOSIPModernCallIsConnecting, "B@:");
+        IOSIPModernAddMethod(cls, @"isAlerting",
+                             (IMP)IOSIPModernCallIsAlerting, "B@:");
+        IOSIPModernAddMethod(cls, @"shouldPlayInCallSounds",
+                             (IMP)IOSIPModernCallIsAlerting, "B@:");
+        IOSIPModernAddMethod(cls, @"isActive",
+                             (IMP)IOSIPModernCallIsActive, "B@:");
+        IOSIPModernAddMethod(cls, @"isStatusFinal",
+                             (IMP)IOSIPModernCallIsFinal, "B@:");
+        for (NSString *name in @[@"isEndpointOnCurrentDevice",
+                                 @"isHostedOnCurrentDevice",
+                                 @"managesAudioInterruptions"])
+            IOSIPModernAddMethod(cls, name, (IMP)IOSIPModernYes, "B@:");
+        for (NSString *name in @[@"isVideo", @"isVoIPCall",
+                                 @"isEmergencyCall", @"isVoicemail",
+                                 @"isOnHold", @"isBlocked",
+                                 @"shouldSuppressRingtone"])
+            IOSIPModernAddMethod(cls, name, (IMP)IOSIPModernNo, "B@:");
+        IOSIPModernAddMethod(cls, @"answer", (IMP)IOSIPModernAnswer,
+                             "v@:");
+        IOSIPModernAddMethod(cls, @"disconnect",
+                             (IMP)IOSIPModernDisconnect, "v@:");
+        IOSIPModernAddMethod(cls, @"isMuted", (IMP)IOSIPModernIsMuted,
+                             "B@:");
+        IOSIPModernAddMethod(cls, @"setMuted:",
+                             (IMP)IOSIPModernSetMuted, "B@:B");
+        IOSIPModernAddMethod(cls, @"playDTMFToneForKey:",
+                             (IMP)IOSIPModernPlayDTMF, "v@:C");
+        objc_registerClassPair(cls);
+    }
+    IOSIPModernCall = ((id (*)(id, SEL, id))objc_msgSend)(
+        [cls alloc], @selector(initWithUniqueProxyIdentifier:),
+        @"me.ancal.iosip.call");
+    IOSIPModernCallGroup = [groupClass new];
+    ((void (*)(id, SEL, id))objc_msgSend)(
+        IOSIPModernCallGroup, @selector(setCalls:), @[IOSIPModernCall]);
+    return IOSIPModernCall && IOSIPModernCallGroup;
+}
+
+static void IOSIPNotifyModernState(void)
+{
+    if (!IOSIPModernCall)
+        return;
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    [center postNotificationName:IOSIPTUCallStatusNotification
+                          object:IOSIPModernCall];
+    [center postNotificationName:IOSIPTUCallModelNotification object:nil];
+    if ([IOSIPCurrentState[@"state"] isEqualToString:@"connected"])
+        [center postNotificationName:IOSIPTUCallConnectedNotification
+                              object:IOSIPModernCall];
+}
+
+static void IOSIPActivateModernCallUI(void)
+{
+    if (!IOSIPIsSpringBoardProcess && !IOSIPIsInCallServiceProcess)
+        return;
+    if (IOSIPIsInCallServiceProcess && !IOSIPModernCall)
+        return;
+    if (!IOSIPModernHasCall()) {
+        IOSIPActivatedCallID = nil;
+        return;
+    }
+    NSString *callID = IOSIPCurrentState[@"call_id"] ?:
+        @"me.ancal.iosip.call";
+    if ([IOSIPActivatedCallID isEqualToString:callID])
+        return;
+    if (IOSIPIsInCallServiceProcess) {
+        id application = [UIApplication sharedApplication];
+        SEL selector = @selector(activateRemoteAlertsForCall:withURL:);
+        if (![application respondsToSelector:selector])
+            return;
+        ((void (*)(id, SEL, id, id))objc_msgSend)(
+            application, selector, IOSIPModernCall, nil);
+        IOSIPActivatedCallID = callID;
+        return;
+    }
+    id application = [UIApplication sharedApplication];
+    SEL launch = @selector(launchApplicationWithIdentifier:suspended:);
+    if ([application respondsToSelector:launch])
+        ((void (*)(id, SEL, id, BOOL))objc_msgSend)(
+            application, launch, @"com.apple.InCallService", NO);
+    IOSIPActivatedCallID = callID;
 }
 
 static Boolean IOSIPPNIsValidPhoneNumberForCountry(
@@ -556,7 +885,7 @@ static int IOSIPCTCallGetCountOfUnreadCallsWithTypes(CFArrayRef types)
     int count = OriginalCTCallGetCountOfUnreadCallsWithTypes(types);
     if (types &&
         ![(__bridge NSArray *)types
-            containsObject:(__bridge NSString *)kCTCallTypeNormal])
+            containsObject:(__bridge NSString *)IOSIPCTCallTypeNormal])
         return count;
     NSArray *history;
     @synchronized (IOSIPNotification) {
@@ -708,7 +1037,7 @@ static Boolean IOSIPCTCallGetStartTime(CTCallRef call, double *startTime)
 
 static CFStringRef IOSIPCTCallGetCallType(CTCallRef call)
 {
-    return IOSIPIsSyntheticCall(call) ? kCTCallTypeNormal :
+    return IOSIPIsSyntheticCall(call) ? IOSIPCTCallTypeNormal :
         OriginalCTCallGetCallType(call);
 }
 
@@ -730,18 +1059,9 @@ static Boolean IOSIPCTCallGetDuration(CTCallRef call, double *duration)
 
 static CTCallRef IOSIPCTCallDialWithID(CFStringRef number, int uid)
 {
-    NSString *normalized =
-        IOSIPNormalizeNumber((__bridge NSString *)number);
-    if (!normalized)
-        return NULL;
-    NSString *reply = IOSIPCommand(
-        [@"CALL " stringByAppendingString:normalized]);
-    if ([reply isEqualToString:@"OK"]) {
-        NSDictionary *state = IOSIPState();
-        if (state)
-            IOSIPCurrentState = state;
+    NSString *reply = IOSIPDialReply((__bridge NSString *)number);
+    if ([reply isEqualToString:@"OK"])
         return IOSIPActiveCallToken();
-    }
     if ([reply isEqualToString:@"UNREGISTERED"])
         return OriginalCTCallDialWithID(number, uid);
     return NULL;
@@ -821,12 +1141,12 @@ static void IOSIPCTTelephonyCenterAddObserver(
         OriginalCTTelephonyCenterAddObserver(
             center, observer, callback, name, object, suspension);
     BOOL callNotification =
-        name && (CFEqual(name, kCTCallStatusChangeNotification) ||
-                 CFEqual(name, kCTCallIdentificationChangeNotification));
+        name && (CFEqual(name, IOSIPCTCallStatusChangeNotification) ||
+                 CFEqual(name, IOSIPCTCallIdentificationChangeNotification));
     BOOL historyNotification =
-        name && (CFEqual(name, kCTCallHistoryRecordAddNotification) ||
+        name && (CFEqual(name, IOSIPCTCallHistoryRecordAddNotification) ||
                  CFEqual(
-                     name, kCTCallHistorySignificantChangeNotification));
+                     name, IOSIPCTCallHistorySignificantChangeNotification));
     if ((!callNotification && !historyNotification) ||
         (callNotification && object && object != IOSIPCallToken) ||
         (historyNotification && object) ||
@@ -915,6 +1235,229 @@ static void IOSIPHook(const char *symbol, void *replacement,
         MSHookFunction(target, replacement, original);
 }
 
+%group IOSIPDialerHooks
+
+%hook DialerController
+
+- (void)performCallActionForService:(int)service
+{
+    if (service != 1) {
+        %orig;
+        return;
+    }
+    Ivar ivar = class_getInstanceVariable([(id)self class], "_dialerView");
+    id dialerView = ivar ? object_getIvar(self, ivar) : nil;
+    id lcdView = [dialerView respondsToSelector:@selector(lcdView)] ?
+        ((id (*)(id, SEL))objc_msgSend)(dialerView, @selector(lcdView)) : nil;
+    NSString *number = [lcdView respondsToSelector:@selector(text)] ?
+        ((id (*)(id, SEL))objc_msgSend)(lcdView, @selector(text)) : nil;
+    NSString *reply = IOSIPDialReply(number);
+    if (!reply || [reply isEqualToString:@"UNREGISTERED"])
+        %orig;
+}
+
+- (void)_updateCallButtonEnabledState:(NSString *)number
+{
+    %orig;
+    if (!IOSIPIsDialableNumber(number))
+        return;
+    Ivar ivar = class_getInstanceVariable([(id)self class], "_dialerView");
+    id dialerView = ivar ? object_getIvar(self, ivar) : nil;
+    id callButton = [dialerView callButton];
+    SEL selector = @selector(setCharge:);
+    if ([callButton respondsToSelector:selector])
+        ((void (*)(id, SEL, CGFloat))objc_msgSend)(
+            callButton, selector, (CGFloat)-0.3);
+}
+
+%end
+
+%end
+
+%group IOSIPModernHooks
+
+%hook TUCallCenter
+
+- (NSArray *)currentCalls
+{
+    return IOSIPModernHasCall() ? @[IOSIPModernCall] : %orig;
+}
+
+- (NSArray *)_allCalls
+{
+    return IOSIPModernHasCall() ? @[IOSIPModernCall] : %orig;
+}
+
+- (NSArray *)currentAudioAndVideoCalls
+{
+    return IOSIPModernHasCall() ? @[IOSIPModernCall] : %orig;
+}
+
+- (NSArray *)displayedCalls
+{
+    return IOSIPModernHasCall() ? @[IOSIPModernCall] : %orig;
+}
+
+- (NSArray *)incomingCalls
+{
+    return IOSIPModernHasCall() ?
+        ([IOSIPCurrentState[@"state"] isEqualToString:@"incoming"] ?
+            @[IOSIPModernCall] : @[]) : %orig;
+}
+
+- (NSArray *)currentCallGroups
+{
+    return IOSIPModernHasCall() ? @[IOSIPModernCallGroup] : %orig;
+}
+
+- (NSUInteger)currentCallCount
+{
+    return IOSIPModernHasCall() ? 1 : %orig;
+}
+
+- (NSUInteger)currentAudioAndVideoCallCount
+{
+    return IOSIPModernHasCall() ? 1 : %orig;
+}
+
+- (id)incomingCall
+{
+    if (!IOSIPModernHasCall())
+        return %orig;
+    return [IOSIPCurrentState[@"state"] isEqualToString:@"incoming"] ?
+        IOSIPModernCall : nil;
+}
+
+- (id)displayedCall
+{
+    return IOSIPModernHasCall() ? IOSIPModernCall : %orig;
+}
+
+- (id)frontmostCall
+{
+    return IOSIPModernHasCall() ? IOSIPModernCall : %orig;
+}
+
+- (id)frontmostAudioOrVideoCall
+{
+    return IOSIPModernHasCall() ? IOSIPModernCall : %orig;
+}
+
+- (id)displayedCallFromCalls:(NSArray *)calls
+{
+    return [calls containsObject:IOSIPModernCall] ? IOSIPModernCall : %orig;
+}
+
+- (id)callWithStatus:(int)status
+{
+    return IOSIPModernHasCall() && status == IOSIPModernCallStatus(nil, 0) ?
+        IOSIPModernCall : %orig;
+}
+
+- (NSArray *)callsWithStatus:(int)status
+{
+    return IOSIPModernHasCall() ?
+        (status == IOSIPModernCallStatus(nil, 0) ?
+            @[IOSIPModernCall] : @[]) : %orig;
+}
+
+- (id)audioOrVideoCallWithStatus:(int)status
+{
+    return IOSIPModernHasCall() && status == IOSIPModernCallStatus(nil, 0) ?
+        IOSIPModernCall : %orig;
+}
+
+- (NSArray *)audioAndVideoCallsWithStatus:(int)status
+{
+    return IOSIPModernHasCall() ?
+        (status == IOSIPModernCallStatus(nil, 0) ?
+            @[IOSIPModernCall] : @[]) : %orig;
+}
+
+- (BOOL)isAddCallAllowed
+{
+    return IOSIPModernHasCall() ? NO : %orig;
+}
+
+- (BOOL)isHoldAllowed
+{
+    return IOSIPModernHasCall() ? NO : %orig;
+}
+
+- (BOOL)anyCallIsHostedOnCurrentDevice
+{
+    return IOSIPModernHasCall() ? YES : %orig;
+}
+
+- (BOOL)anyCallIsEndpointOnCurrentDevice
+{
+    return IOSIPModernHasCall() ? YES : %orig;
+}
+
+- (void)answerCall:(id)call
+{
+    if (call == IOSIPModernCall)
+        IOSIPModernAnswer(call, _cmd);
+    else
+        %orig;
+}
+
+- (void)answerCall:(id)call withSourceIdentifier:(id)source
+{
+    if (call == IOSIPModernCall)
+        IOSIPModernAnswer(call, _cmd);
+    else
+        %orig;
+}
+
+- (void)answerCall:(id)call
+    withSourceIdentifier:(id)source
+    wantsHoldMusic:(BOOL)holdMusic
+{
+    if (call == IOSIPModernCall)
+        IOSIPModernAnswer(call, _cmd);
+    else
+        %orig;
+}
+
+- (void)disconnectCall:(id)call
+{
+    if (call == IOSIPModernCall)
+        IOSIPModernDisconnect(call, _cmd);
+    else
+        %orig;
+}
+
+- (void)disconnectCall:(id)call withReason:(int)reason
+{
+    if (call == IOSIPModernCall)
+        IOSIPModernDisconnect(call, _cmd);
+    else
+        %orig;
+}
+
+- (void)resumeCall:(id)call
+{
+    if (call != IOSIPModernCall)
+        %orig;
+}
+
+- (void)disconnectAllCalls
+{
+    if (IOSIPModernHasCall())
+        IOSIPModernDisconnect(IOSIPModernCall, _cmd);
+    else
+        %orig;
+}
+
+%end
+
+
+%end
+
+
+%group IOSIPLegacyHooks
+
 %hook PhoneApplication
 
 - (BOOL)shouldAttemptPhoneCall
@@ -976,21 +1519,6 @@ static void IOSIPHook(const char *symbol, void *replacement,
 
 %end
 
-%hook DialerController
-
-- (void)_updateCallButtonEnabledState:(NSString *)number
-{
-    %orig;
-    if (!IOSIPIsDialableNumber(number))
-        return;
-    Ivar ivar = class_getInstanceVariable([(id)self class], "_dialerView");
-    id dialerView = ivar ? object_getIvar(self, ivar) : nil;
-    id callButton = [dialerView callButton];
-    [callButton setCharge:-0.3f];
-}
-
-%end
-
 %hook AudioDeviceController
 
 - (void)_pickRoute:(id)route
@@ -1041,15 +1569,80 @@ static void IOSIPHook(const char *symbol, void *replacement,
 
 %end
 
-%ctor
+%end
+
+static void IOSIPInitialize(void)
 {
     @autoreleasepool {
+        static BOOL initialized;
+        if (initialized)
+            return;
+        initialized = YES;
         NSString *bundle = [NSBundle mainBundle].bundleIdentifier;
         if (![bundle isEqualToString:@"com.apple.mobilephone"] &&
-            ![bundle isEqualToString:@"com.apple.springboard"])
+            ![bundle isEqualToString:@"com.apple.springboard"] &&
+            ![bundle isEqualToString:@"com.apple.InCallService"])
             return;
         IOSIPIsSpringBoardProcess =
             [bundle isEqualToString:@"com.apple.springboard"];
+        IOSIPIsInCallServiceProcess =
+            [bundle isEqualToString:@"com.apple.InCallService"];
+        if ([bundle isEqualToString:@"com.apple.mobilephone"])
+            %init(IOSIPDialerHooks);
+        BOOL modern =
+            [UIDevice currentDevice].systemVersion.integerValue >= 7;
+        if (modern && IOSIPIsSpringBoardProcess) {
+            IOSIPCurrentState = IOSIPState() ?: @{};
+            IOSIPGeneration =
+                [IOSIPCurrentState[@"generation"] unsignedLongLongValue];
+            CFNotificationCenterAddObserver(
+                CFNotificationCenterGetDarwinNotifyCenter(),
+                NULL,
+                IOSIPStateChanged,
+                (__bridge CFStringRef)IOSIPNotification,
+                NULL,
+                CFNotificationSuspensionBehaviorDeliverImmediately);
+            return;
+        }
+        if (modern) {
+            if (!IOSIPCreateModernCall())
+                return;
+            %init(IOSIPModernHooks);
+        } else {
+            %init(IOSIPLegacyHooks);
+        }
+
+        IOSIPCTCallStatusChangeNotification = IOSIPCoreTelephonyConstant(
+            "kCTCallStatusChangeNotification",
+            CFSTR("kCTCallStatusChangeNotification"));
+        IOSIPCTCallIdentificationChangeNotification =
+            IOSIPCoreTelephonyConstant(
+                "kCTCallIdentificationChangeNotification",
+                CFSTR("kCTCallIdentificationChangeNotification"));
+        IOSIPCTCallHistoryRecordAddNotification =
+            IOSIPCoreTelephonyConstant(
+                "kCTCallHistoryRecordAddNotification",
+                CFSTR("kCTCallHistoryRecordAddNotification"));
+        IOSIPCTCallHistorySignificantChangeNotification =
+            IOSIPCoreTelephonyConstant(
+                "kCTCallHistorySignificantChangeNotification",
+                CFSTR("kCTCallHistorySignificantChangeNotification"));
+        IOSIPCTCall = IOSIPCoreTelephonyConstant(
+            "kCTCall", CFSTR("kCTCall"));
+        IOSIPCTCallTypeNormal = IOSIPCoreTelephonyConstant(
+            "kCTCallTypeNormal", CFSTR("kCTCallTypeNormal"));
+        IOSIPTUCallStatusNotification =
+            (__bridge NSString *)IOSIPCoreTelephonyConstant(
+                "TUCallCenterCallStatusChangedNotification",
+                CFSTR("TUCallCenterCallStatusChangedNotification"));
+        IOSIPTUCallModelNotification =
+            (__bridge NSString *)IOSIPCoreTelephonyConstant(
+                "TUCallCenterModelStateChangedNotification",
+                CFSTR("TUCallCenterModelStateChangedNotification"));
+        IOSIPTUCallConnectedNotification =
+            (__bridge NSString *)IOSIPCoreTelephonyConstant(
+                "TUCallCenterCallConnectedNotification",
+                CFSTR("TUCallCenterCallConnectedNotification"));
 
         IOSIPCurrentState = IOSIPState() ?: @{};
         IOSIPGeneration =
@@ -1059,6 +1652,7 @@ static void IOSIPHook(const char *symbol, void *replacement,
                 unsignedLongLongValue];
         IOSIPReloadHistory();
 
+        if (!modern) {
 #define IOSIP_HOOK(symbol) \
         IOSIPHook(#symbol, (void *)&IOSIP##symbol, \
                    (void **)&Original##symbol)
@@ -1112,6 +1706,7 @@ static void IOSIPHook(const char *symbol, void *replacement,
                        (void *)&IOSIPPNIsValidPhoneNumberForCountry,
                        (void **)&OriginalPNIsValidPhoneNumberForCountry);
         }
+        }
 
         CFNotificationCenterAddObserver(
             CFNotificationCenterGetDarwinNotifyCenter(),
@@ -1128,5 +1723,42 @@ static void IOSIPHook(const char *symbol, void *replacement,
             NULL,
             CFNotificationSuspensionBehaviorDeliverImmediately);
         IOSIPReloadState();
+        if (modern && IOSIPIsInCallServiceProcess)
+            IOSIPActivateModernCallUI();
+    }
+}
+
+%ctor
+{
+    @autoreleasepool {
+        NSString *bundle = [NSBundle mainBundle].bundleIdentifier;
+        NSString *className =
+            [bundle isEqualToString:@"com.apple.mobilephone"] ?
+                @"DialerController" :
+            ([bundle isEqualToString:@"com.apple.springboard"] ?
+                @"SBTelephonyManager" :
+            ([bundle isEqualToString:@"com.apple.InCallService"] ?
+                @"InCallServiceApplication" : nil));
+        if (!className)
+            return;
+        BOOL deferUntilLaunch =
+            [bundle isEqualToString:@"com.apple.InCallService"] ||
+            (!NSClassFromString(className) &&
+             ![bundle isEqualToString:@"com.apple.springboard"]);
+        if (!deferUntilLaunch && NSClassFromString(className)) {
+            IOSIPInitialize();
+        } else if (deferUntilLaunch) {
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:UIApplicationDidFinishLaunchingNotification
+                object:nil
+                queue:[NSOperationQueue mainQueue]
+                usingBlock:^(__unused NSNotification *notification) {
+                    IOSIPInitialize();
+                }];
+        } else {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                IOSIPInitialize();
+            });
+        }
     }
 }

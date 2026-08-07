@@ -1,12 +1,12 @@
-ARCHS = armv7
+ARCHS = armv7 arm64
 TARGET = iphone:clang:10.3:6.0
-TARGET_CODESIGN = /usr/bin/true
 
 include $(THEOS)/makefiles/common.mk
 
 TOOL_NAME = iosipd iosipctl
 iosipd_FILES = daemon/main.m
 iosipd_CFLAGS = -fobjc-arc -Wno-deprecated-module-dot-map \
+	-Wno-deprecated-declarations \
 	-DPJ_AUTOCONF=1 \
 	-Ivendor/pjproject/pjlib/include \
 	-Ivendor/pjproject/pjlib-util/include \
@@ -14,11 +14,11 @@ iosipd_CFLAGS = -fobjc-arc -Wno-deprecated-module-dot-map \
 	-Ivendor/pjproject/pjmedia/include \
 	-Ivendor/pjproject/pjsip/include
 iosipd_LDFLAGS = -Wl,-all_load \
-	$(shell find vendor/pjproject -path '*/lib/*.a' \
+	$(shell find vendor/pjproject \
+		-path '*/lib/*-$(THEOS_CURRENT_ARCH)-apple-darwin_ios.a' \
 		! -name 'libpjsdp-*' -print) \
 	-Wl,-undefined,dynamic_lookup
-iosipd_FRAMEWORKS = Foundation AudioToolbox AVFoundation CoreAudio CoreFoundation
-iosipd_PRIVATE_FRAMEWORKS = SpringBoardServices
+iosipd_FRAMEWORKS = Foundation AudioToolbox AVFoundation CoreAudio CoreFoundation UIKit
 iosipd_INSTALL_PATH = /usr/libexec
 
 iosipctl_FILES = tools/iosipctl.c
@@ -33,10 +33,10 @@ IOSIP_LDFLAGS = -Wl,-undefined,dynamic_lookup
 BUNDLE_NAME = IOSIPPrefs
 IOSIPPrefs_FILES = prefs/IOSIPRootListController.m tweak/SIPIPC.m
 IOSIPPrefs_FRAMEWORKS = Foundation UIKit
-IOSIPPrefs_PRIVATE_FRAMEWORKS = Preferences
 IOSIPPrefs_INSTALL_PATH = /Library/PreferenceBundles
 IOSIPPrefs_RESOURCE_DIRS = prefs/Resources
 IOSIPPrefs_CFLAGS = -fobjc-arc -Wno-deprecated-module-dot-map
+IOSIPPrefs_LDFLAGS = -Wl,-undefined,dynamic_lookup
 
 include $(THEOS_MAKE_PATH)/tool.mk
 include $(THEOS_MAKE_PATH)/tweak.mk
