@@ -2,10 +2,30 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <stdio.h>
 #include <string.h>
+
+static int OpenSocket(int family)
+{
+    int socketFD = socket(family, SOCK_STREAM, 0);
+    if (socketFD < 0)
+        return -1;
+    int enabled = 1;
+    struct timeval timeout = {2, 0};
+    if (setsockopt(socketFD, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+                   sizeof(enabled)) != 0 ||
+        setsockopt(socketFD, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                   sizeof(timeout)) != 0 ||
+        setsockopt(socketFD, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                   sizeof(timeout)) != 0) {
+        close(socketFD);
+        return -1;
+    }
+    return socketFD;
+}
 
 int main(int argc, char **argv)
 {
@@ -23,49 +43,57 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-    FILE *tokenFile = fopen("/var/mobile/Library/IOSIP/ipc-token", "r");
-    char token[64] = {0};
-    if (!tokenFile || !fgets(token, sizeof(token), tokenFile)) {
-        if (tokenFile)
-            fclose(tokenFile);
-        fprintf(stderr, "iosipctl: token unavailable\n");
-        return 1;
-    }
-    fclose(tokenFile);
-    token[strcspn(token, "\r\n")] = '\0';
-    char request[384] = {0};
-    if (strlen(token) < 16 ||
-        snprintf(request, sizeof(request), "%s %s\n", token, command) >=
-            (int)sizeof(request)) {
-        fprintf(stderr, "iosipctl: command too long\n");
-        return 2;
-    }
-
-    int socketFD = socket(AF_INET, SOCK_STREAM, 0);
+    int socketFD = OpenSocket(AF_UNIX);
     if (socketFD < 0) {
         perror("iosipctl");
         return 1;
     }
-    int enabled = 1;
-    struct timeval timeout = {2, 0};
-    if (setsockopt(socketFD, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
-                   sizeof(enabled)) != 0 ||
-        setsockopt(socketFD, SOL_SOCKET, SO_SNDTIMEO, &timeout,
-                   sizeof(timeout)) != 0 ||
-        setsockopt(socketFD, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                   sizeof(timeout)) != 0) {
-        perror("iosipctl");
+    struct sockaddr_un legacyAddress = {0};
+    legacyAddress.sun_family = AF_UNIX;
+    strlcpy(legacyAddress.sun_path, "/var/run/iosip.sock",
+            sizeof(legacyAddress.sun_path));
+    int legacy = connect(socketFD, (struct sockaddr *)&legacyAddress,
+                         sizeof(legacyAddress)) == 0;
+    if (!legacy) {
         close(socketFD);
-        return 1;
+        socketFD = OpenSocket(AF_INET);
+        struct sockaddr_in address = {0};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(51601);
+        if (socketFD < 0 ||
+            connect(socketFD, (struct sockaddr *)&address,
+                    sizeof(address)) != 0) {
+            perror("iosipctl");
+            if (socketFD >= 0)
+                close(socketFD);
+            return 1;
+        }
     }
-    struct sockaddr_in address = {0};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = htons(51601);
-    if (connect(socketFD, (struct sockaddr *)&address, sizeof(address))) {
-        perror("iosipctl");
-        close(socketFD);
-        return 1;
+
+    char request[384] = {0};
+    if (legacy) {
+        snprintf(request, sizeof(request), "%s\n", command);
+    } else {
+        FILE *tokenFile =
+            fopen("/var/mobile/Library/IOSIP/ipc-token", "r");
+        char token[64] = {0};
+        if (!tokenFile || !fgets(token, sizeof(token), tokenFile)) {
+            if (tokenFile)
+                fclose(tokenFile);
+            close(socketFD);
+            fprintf(stderr, "iosipctl: token unavailable\n");
+            return 1;
+        }
+        fclose(tokenFile);
+        token[strcspn(token, "\r\n")] = '\0';
+        if (strlen(token) < 16 ||
+            snprintf(request, sizeof(request), "%s %s\n", token, command) >=
+                (int)sizeof(request)) {
+            close(socketFD);
+            fprintf(stderr, "iosipctl: command too long\n");
+            return 2;
+        }
     }
     const char *cursor = request;
     size_t remaining = strlen(request);

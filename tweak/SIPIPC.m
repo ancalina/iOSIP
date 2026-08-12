@@ -1,13 +1,16 @@
 #import "SIPIPC.h"
+#import <UIKit/UIKit.h>
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 static const uint16_t IOSIPPort = 51601;
+static const char *IOSIPLegacySocketPath = "/var/run/iosip.sock";
 static NSString *const IOSIPTokenPath =
     @"/var/mobile/Library/IOSIP/ipc-token";
 static NSString *const IOSIPStatePath =
@@ -15,15 +18,19 @@ static NSString *const IOSIPStatePath =
 
 NSString *IOSIPCommand(NSString *command)
 {
-    NSString *token = [[NSString stringWithContentsOfFile:IOSIPTokenPath
-                                                  encoding:NSUTF8StringEncoding
-                                                     error:nil]
-        stringByTrimmingCharactersInSet:
-            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (token.length < 16)
-        return nil;
+    BOOL legacy = [UIDevice currentDevice].systemVersion.integerValue < 7;
+    NSString *token;
+    if (!legacy) {
+        token = [[NSString stringWithContentsOfFile:IOSIPTokenPath
+                                           encoding:NSUTF8StringEncoding
+                                              error:nil]
+            stringByTrimmingCharactersInSet:
+                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (token.length < 16)
+            return nil;
+    }
 
-    int socketFD = socket(AF_INET, SOCK_STREAM, 0);
+    int socketFD = socket(legacy ? AF_UNIX : AF_INET, SOCK_STREAM, 0);
     if (socketFD < 0)
         return nil;
 
@@ -39,16 +46,31 @@ NSString *IOSIPCommand(NSString *command)
         return nil;
     }
 
-    struct sockaddr_in address = {0};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = htons(IOSIPPort);
-    if (connect(socketFD, (struct sockaddr *)&address, sizeof(address)) != 0) {
-        close(socketFD);
-        return nil;
+    if (legacy) {
+        struct sockaddr_un address = {0};
+        address.sun_family = AF_UNIX;
+        strlcpy(address.sun_path, IOSIPLegacySocketPath,
+                sizeof(address.sun_path));
+        if (connect(socketFD, (struct sockaddr *)&address,
+                    sizeof(address)) != 0) {
+            close(socketFD);
+            return nil;
+        }
+    } else {
+        struct sockaddr_in address = {0};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(IOSIPPort);
+        if (connect(socketFD, (struct sockaddr *)&address,
+                    sizeof(address)) != 0) {
+            close(socketFD);
+            return nil;
+        }
     }
 
-    NSString *line = [NSString stringWithFormat:@"%@ %@\n", token, command];
+    NSString *line = legacy ?
+        [command stringByAppendingString:@"\n"] :
+        [NSString stringWithFormat:@"%@ %@\n", token, command];
     NSData *request = [line
         dataUsingEncoding:NSUTF8StringEncoding];
     const uint8_t *requestBytes = request.bytes;

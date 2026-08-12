@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 static NSString *const ConfigPath =
@@ -25,7 +26,15 @@ static NSString *const IPCTokenPath =
 static NSString *const CallStateLock =
     @"me.ancal.iosip.call-state";
 static const uint16_t IPCPort = 51601;
+static const char *LegacySocketPath = "/var/run/iosip.sock";
 static NSString *IPCToken;
+
+static BOOL UsesLegacyIPC(void)
+{
+    NSDictionary *system = [NSDictionary dictionaryWithContentsOfFile:
+        @"/System/Library/CoreServices/SystemVersion.plist"];
+    return [system[@"ProductVersion"] integerValue] < 7;
+}
 
 static void LaunchPhoneApplication(void)
 {
@@ -1335,25 +1344,43 @@ static NSString *HandleCommand(NSString *command)
 
 static void Serve(void)
 {
-    int server = socket(AF_INET, SOCK_STREAM, 0);
+    BOOL legacy = UsesLegacyIPC();
+    if (legacy)
+        unlink(LegacySocketPath);
+    int server = socket(legacy ? AF_UNIX : AF_INET, SOCK_STREAM, 0);
     if (server < 0)
         return;
 
-    int reuse = 1;
-    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    struct sockaddr_in address = {0};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = htons(IPCPort);
-    if (bind(server, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-        listen(server, 4) != 0) {
+    int bound;
+    if (legacy) {
+        struct sockaddr_un address = {0};
+        address.sun_family = AF_UNIX;
+        strlcpy(address.sun_path, LegacySocketPath,
+                sizeof(address.sun_path));
+        bound = bind(server, (struct sockaddr *)&address, sizeof(address));
+    } else {
+        int reuse = 1;
+        setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        struct sockaddr_in address = {0};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(IPCPort);
+        bound = bind(server, (struct sockaddr *)&address, sizeof(address));
+    }
+    if (bound != 0 || listen(server, 4) != 0) {
         close(server);
+        if (legacy)
+            unlink(LegacySocketPath);
         return;
+    }
+    if (legacy) {
+        chown(LegacySocketPath, 0, 501);
+        chmod(LegacySocketPath, 0660);
     }
 
     for (;;) {
         @autoreleasepool {
-        struct sockaddr_in peer = {0};
+        struct sockaddr_storage peer = {0};
         socklen_t peerLength = sizeof(peer);
         int client = accept(server, (struct sockaddr *)&peer, &peerLength);
         if (client < 0) {
@@ -1361,11 +1388,22 @@ static void Serve(void)
                 continue;
             break;
         }
-        if (peer.sin_family != AF_INET ||
-            peer.sin_addr.s_addr != htonl(INADDR_LOOPBACK) ||
-            !ConfigureClientSocket(client)) {
+        struct sockaddr_in *internetPeer = (struct sockaddr_in *)&peer;
+        BOOL allowed = legacy ||
+            (internetPeer->sin_family == AF_INET &&
+             internetPeer->sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+        if (!allowed || !ConfigureClientSocket(client)) {
             close(client);
             continue;
+        }
+        if (legacy) {
+            uid_t user;
+            gid_t group;
+            if (getpeereid(client, &user, &group) != 0 ||
+                (user != 0 && user != 501)) {
+                close(client);
+                continue;
+            }
         }
         char buffer[512] = {0};
         ssize_t length = ReadCommand(client, buffer, sizeof(buffer));
@@ -1376,10 +1414,15 @@ static void Serve(void)
                      encoding:NSUTF8StringEncoding]
                 stringByTrimmingCharactersInSet:
                     [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-            NSString *prefix = [IPCToken stringByAppendingString:@" "];
-            NSString *response = [request hasPrefix:prefix] ?
-                HandleCommand([request substringFromIndex:prefix.length]) :
-                @"UNAUTHORIZED";
+            NSString *response;
+            if (legacy) {
+                response = HandleCommand(request ?: @"");
+            } else {
+                NSString *prefix = [IPCToken stringByAppendingString:@" "];
+                response = [request hasPrefix:prefix] ?
+                    HandleCommand([request substringFromIndex:prefix.length]) :
+                    @"UNAUTHORIZED";
+            }
             NSData *data = [[response stringByAppendingString:@"\n"]
                 dataUsingEncoding:NSUTF8StringEncoding];
             WriteAll(client, data.bytes, data.length);
@@ -1390,6 +1433,8 @@ static void Serve(void)
         }
     }
     close(server);
+    if (legacy)
+        unlink(LegacySocketPath);
 }
 
 int main(int argc, char **argv)
@@ -1397,7 +1442,7 @@ int main(int argc, char **argv)
     @autoreleasepool {
         RestoreStateMetadata();
         PostState(@"idle", @"");
-        if (!LoadIPCToken())
+        if (!UsesLegacyIPC() && !LoadIPCToken())
             return 1;
         NSDictionary *config =
             [NSDictionary dictionaryWithContentsOfFile:ConfigPath];

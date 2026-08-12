@@ -41,6 +41,7 @@ static unsigned long long IOSIPGeneration;
 static unsigned long long IOSIPHistoryGeneration;
 static BOOL IOSIPIsSpringBoardProcess;
 static BOOL IOSIPIsInCallServiceProcess;
+static BOOL IOSIPUsesModernCallUI;
 static BOOL IOSIPPhoneAudioReleased;
 static BOOL IOSIPMuted;
 static id IOSIPPhoneAudioController;
@@ -722,6 +723,8 @@ static void IOSIPNotifyModernState(void)
 
 static void IOSIPActivateModernCallUI(void)
 {
+    if (!IOSIPUsesModernCallUI)
+        return;
     if (!IOSIPIsSpringBoardProcess && !IOSIPIsInCallServiceProcess)
         return;
     if (IOSIPIsInCallServiceProcess && !IOSIPModernCall)
@@ -1241,6 +1244,10 @@ static void IOSIPHook(const char *symbol, void *replacement,
 
 - (void)performCallActionForService:(int)service
 {
+    if (!IOSIPUsesModernCallUI) {
+        %orig;
+        return;
+    }
     if (service != 1) {
         %orig;
         return;
@@ -1587,10 +1594,11 @@ static void IOSIPInitialize(void)
             [bundle isEqualToString:@"com.apple.springboard"];
         IOSIPIsInCallServiceProcess =
             [bundle isEqualToString:@"com.apple.InCallService"];
+        IOSIPUsesModernCallUI =
+            [UIDevice currentDevice].systemVersion.integerValue >= 7;
         if ([bundle isEqualToString:@"com.apple.mobilephone"])
             %init(IOSIPDialerHooks);
-        BOOL modern =
-            [UIDevice currentDevice].systemVersion.integerValue >= 7;
+        BOOL modern = IOSIPUsesModernCallUI;
         if (modern && IOSIPIsSpringBoardProcess) {
             IOSIPCurrentState = IOSIPState() ?: @{};
             IOSIPGeneration =
@@ -1732,6 +1740,10 @@ static void IOSIPInitialize(void)
 {
     @autoreleasepool {
         NSString *bundle = [NSBundle mainBundle].bundleIdentifier;
+        if ([UIDevice currentDevice].systemVersion.integerValue < 7) {
+            IOSIPInitialize();
+            return;
+        }
         NSString *className =
             [bundle isEqualToString:@"com.apple.mobilephone"] ?
                 @"DialerController" :

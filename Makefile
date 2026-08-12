@@ -18,7 +18,7 @@ iosipd_LDFLAGS = -Wl,-all_load \
 		-path '*/lib/*-$(THEOS_CURRENT_ARCH)-apple-darwin_ios.a' \
 		! -name 'libpjsdp-*' -print) \
 	-Wl,-undefined,dynamic_lookup
-iosipd_FRAMEWORKS = Foundation AudioToolbox AVFoundation CoreAudio CoreFoundation UIKit
+iosipd_FRAMEWORKS = Foundation AudioToolbox AVFoundation CoreAudio CoreFoundation
 iosipd_INSTALL_PATH = /usr/libexec
 
 iosipctl_FILES = tools/iosipctl.c

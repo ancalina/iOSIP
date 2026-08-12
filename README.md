@@ -15,6 +15,8 @@ notifications.
 The package contains both `armv7` and `arm64` binaries. Other devices and
 iOS versions are untested.
 
+iOS 6 uses the legacy v1.0 call path. iOS 7-9 support is experimental.
+
 Settings languages: English and Korean.
 
 ## Requirements
